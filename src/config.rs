@@ -26,6 +26,13 @@ pub struct Config {
     pub visible_resources: Option<BTreeMap<String, Vec<String>>>,
     /// 时钟偏移（秒），默认 60。
     pub clock_skew_seconds: i64,
+    /// 是否要求每条授权记录都带签发方签名。
+    ///
+    /// - `register`：缺签名 / 验不过 → 拒收；
+    /// - 从磁盘加载：验不过的记录直接丢弃。
+    pub require_signature: bool,
+    /// 信任的签发方 Ed25519 公钥（裸 32 字节）。空 = 一把都不信（fail-closed）。
+    pub issuer_public_keys: Vec<Vec<u8>>,
 }
 
 impl Config {
@@ -42,6 +49,8 @@ impl Config {
             max_ttl_by_role: BTreeMap::new(),
             visible_resources: None,
             clock_skew_seconds: 60,
+            require_signature: false,
+            issuer_public_keys: Vec::new(),
         }
     }
 
@@ -71,5 +80,24 @@ impl Config {
     pub fn base_path(mut self, path: impl Into<String>) -> Self {
         self.base_path = path.into();
         self
+    }
+
+    /// 要求每条授权记录带签发方签名。开了就必须至少放行一把公钥。
+    pub fn require_signature(mut self, require: bool) -> Self {
+        self.require_signature = require;
+        self
+    }
+
+    /// 信任一把签发方公钥（裸 32 字节 Ed25519）。可多次调用以支持轮换期。
+    pub fn issuer_public_key(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.issuer_public_keys.push(key.into());
+        self
+    }
+
+    /// 从 32 字节 hex 文本加一把公钥（`require_signature` 时最常用）。
+    pub fn issuer_public_key_hex(mut self, text: &str) -> crate::Result<Self> {
+        let key = wist_auth::signing::parse_public_key_hex(text).map_err(crate::Error::Config)?;
+        self.issuer_public_keys.push(key);
+        Ok(self)
     }
 }

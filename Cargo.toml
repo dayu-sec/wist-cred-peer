@@ -1,6 +1,6 @@
 [package]
 name = "wist-cred-peer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Verifier-side (X) runtime for wist-cred: receive credential digests over mutual TLS and keep their own state"
@@ -20,7 +20,8 @@ axum = "0.8"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # 摘要表、裁剪、错误码都在验证侧实现里，不在这里另写一套。
-wist-auth = { version = "0.2", features = ["credential"] }
+# `signing`：授权记录的 Ed25519 验签（收到时 + 从磁盘加载时）。
+wist-auth = { version = "0.3", features = ["credential", "signing"] }
 # 握手期的双向认证与「这张客户端证书是谁」。
 wist-pki = "0.1.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
@@ -33,3 +34,5 @@ tower = { version = "0.5", features = ["util"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+# 测试里现生成 Ed25519 钥（与 `wist-auth/signing` 同一套原语）。
+ring = "0.17"

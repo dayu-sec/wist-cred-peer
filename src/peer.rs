@@ -33,12 +33,34 @@ impl Peer {
         if config.allowed_issuers.is_empty() {
             // 不拦启动：本地调试可能先起服务再补配置。但推不进来，日志里会看到 403。
         }
+        if config.require_signature && config.issuer_public_keys.is_empty() {
+            return Err(Error::Config(
+                "require_signature = true needs at least one issuer_public_key".into(),
+            ));
+        }
+        if config.clock_skew_seconds < 0 {
+            return Err(Error::Config(
+                "clock_skew_seconds must not be negative".into(),
+            ));
+        }
+        // 上限 <= 0 会让凭据一登记就过期；这是配置错，不是运行时问题。
+        if let Some((role, seconds)) = config
+            .max_ttl_by_role
+            .iter()
+            .find(|(_, seconds)| **seconds <= 0)
+        {
+            return Err(Error::Config(format!(
+                "max_ttl for role {role:?} must be > 0, got {seconds}"
+            )));
+        }
 
         let params = StoreParams {
             known_roles: config.known_roles.clone(),
             max_ttl_by_role: config.max_ttl_by_role.clone(),
             visible_resources: config.visible_resources.clone(),
             clock_skew_seconds: config.clock_skew_seconds,
+            require_signature: config.require_signature,
+            issuer_public_keys: config.issuer_public_keys.clone(),
         };
         let store = CredentialStore::open(config.store_path.clone(), params)
             .map_err(|err| Error::Store(err.to_string()))?;
@@ -56,6 +78,11 @@ impl Peer {
     /// 当前登记了几条（给健康检查 / 运维看）。
     pub fn registered(&self) -> usize {
         self.store.entries().len()
+    }
+
+    /// 启动加载时因签名不合格被丢弃的条数（运维应当关注：非 0 意味着磁盘被改过）。
+    pub fn rejected_on_load(&self) -> usize {
+        self.store.rejected_on_load()
     }
 
     /// axum 路由：`POST {base}`、`POST {base}/{id}/revoke`、`GET /healthz`。

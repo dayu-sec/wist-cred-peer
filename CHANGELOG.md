@@ -1,8 +1,28 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-11-03
+
+### Added（授权记录验签）
+
+- `Config` 新增 `require_signature` / `issuer_public_keys`，以及构造器
+  `require_signature(bool)` / `issuer_public_key(bytes)` / `issuer_public_key_hex(text)`。
+  开启后 `register` 缺签名或验不过返回 `400 credential_signature_invalid`；
+  从磁盘加载时验不过的记录直接丢弃。
+- `GET /healthz` 新增 `rejected_on_load`（启动时因签名不合格/malformed 被丢弃的条数）。
+- `Peer::rejected_on_load()`，调用方应写进启动日志。
+- 配置校验：`require_signature = true` 但没有公钥、`max_ttl <= 0`、`clock_skew_seconds < 0`
+  都在启动期拒绝（fail-closed）。
 
 ### Changed
+
+- 依赖 `wist-auth` **0.3**（签名契约）。
+- `revoke` 请求体新增可选 `revoked_at` / `signature`：`require_signature` 时两者必填；
+  旧版 cred 只发 `revision` 时仍可用（但开了验签会被拒）。
+- **升级顺序**：先升所有验证方（本版，`require_signature = false`），再升 `wist-cred`，
+  最后打开 `require_signature`。原因：0.1 的 `RevokeRequest` 是 `deny_unknown_fields`，
+  新版 cred 发的新字段会被旧验证方拒掉。
+
+### Changed（仓内）
 
 - 示例 `peer-service` 移出本仓：它现在是一个**独立 crate**（`wist-cred-stack/dev/peer-example/`），
   依赖走 crates.io 上已发布的 `wist-cred-peer` —— 这样示例演示的就是下游真实的接入形态，

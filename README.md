@@ -57,8 +57,8 @@ cd wist-cred-stack
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `<base_path>` | `register`：收一条摘要（`revision` 单调，低版本拒） |
-| `POST` | `<base_path>/{credential_id}/revoke` | 撤销，幂等 |
-| `GET` | `/healthz` | 心跳（cred 每 30s 探一次） |
+| `POST` | `<base_path>/{credential_id}/revoke` | 撤销，幂等；开验签时带 `revoked_at` + `signature` |
+| `GET` | `/healthz` | 心跳（cred 每 30s 探一次；含 `rejected_on_load`） |
 
 `base_path` 默认 `/api/v1/internal/credentials`，与 cred 推送地址的尾部一致。
 
@@ -68,6 +68,10 @@ cd wist-cred-stack
 - `audience` 必须等于本服务的名字，否则拒（防跨服务重放）。
 - C 提议的角色 / 有效期 / 资源由本服务裁剪（D9），不是照单全收。
 - 只存 `sha256` 摘要，明文永不落盘；撤销后重启不会复活。
+- **授权记录签名（0.2+）**：`Config::require_signature(true).issuer_public_key_hex("<hex>")`。
+  开启后 `register` 拒收无签名 / 验不过的记录，从磁盘加载时丢掉验不过的记录
+  （`Peer::rejected_on_load()` 应当写进启动日志）—— 改角色 / 延长有效期 / 清撤销标记
+  都会被发现。
 
 ## 版本
 

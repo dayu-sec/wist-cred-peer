@@ -18,11 +18,19 @@ use wist_pki::PeerIdentity;
 
 use crate::peer::{AuthDenial, Peer};
 
-/// 撤销请求体：只要 `revision`（比本地记录小就算过期，见 D12）。
+/// 撤销请求体。
+///
+/// - `revision`：比本地记录小就算过期（D12）；
+/// - `revoked_at`：签发方给的撤销时间；缺省时用本机时间（兼容旧版 cred）；
+/// - `signature`：签发方对“已撤销的那条记录”的签名（`require_signature` 时必填）。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeRequest {
     pub revision: u64,
+    #[serde(default)]
+    pub revoked_at: Option<i64>,
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 /// 联调用的校验请求体。**生产不要挂这个路由**（见 [`Peer::router_with_verify`]）。
@@ -86,9 +94,10 @@ async fn revoke(
         return denial.into_response();
     }
 
+    let revoked_at = body.revoked_at.unwrap_or_else(now_secs);
     match peer
         .store()
-        .revoke(&credential_id, body.revision, now_secs())
+        .revoke(&credential_id, body.revision, revoked_at, body.signature)
     {
         Ok(Some(updated)) => (
             StatusCode::OK,
@@ -114,6 +123,7 @@ async fn healthz(State(peer): State<Arc<Peer>>) -> Json<Value> {
         "status": "ok",
         "audience": peer.config().audience,
         "registered": peer.registered(),
+        "rejected_on_load": peer.rejected_on_load(),
     }))
 }
 
@@ -245,6 +255,7 @@ mod tests {
             expires_at: now + 3_600,
             revision,
             revoked_at: None,
+            signature: None,
         }
     }
 
@@ -410,5 +421,117 @@ mod tests {
         assert_eq!(body["status"], "ok");
         assert_eq!(body["audience"], "wist-ingest");
         assert_eq!(body["registered"], 0);
+        assert_eq!(body["rejected_on_load"], 0);
+    }
+
+    // ── 签名（Ed25519）：授权内容被改过就拒收 ───────────────────────────
+
+    use ring::rand::SystemRandom;
+    use ring::signature::Ed25519KeyPair;
+    use wist_auth::signing::{public_key_from_pkcs8, sign};
+
+    fn keypair() -> (Vec<u8>, Vec<u8>) {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("keypair");
+        let public = public_key_from_pkcs8(pkcs8.as_ref()).expect("public");
+        (pkcs8.as_ref().to_vec(), public)
+    }
+
+    fn signed_peer(dir: &TempDir, public: Vec<u8>) -> Arc<Peer> {
+        let config = Config::new("wist-ingest", dir.0.join("credentials.json"))
+            .allow_issuer("wist-cred")
+            .known_roles(["read", "investigation:run"])
+            .require_signature(true)
+            .issuer_public_key(public);
+        Peer::open(config).expect("open signed peer")
+    }
+
+    fn signed_entry(revision: u64, private_key: &[u8]) -> CredentialEntry {
+        let mut entry = entry(revision);
+        entry.signature = Some(sign(&entry, private_key).expect("sign"));
+        entry
+    }
+
+    #[test]
+    fn requiring_signatures_without_a_public_key_fails_closed() {
+        let dir = TempDir::new("sig-nokey");
+        let config =
+            Config::new("wist-ingest", dir.0.join("credentials.json")).require_signature(true);
+        let err = Peer::open(config).err().expect("must reject");
+        assert!(
+            err.to_string().contains("issuer_public_key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_ttl_or_negative_skew_is_rejected() {
+        let dir = TempDir::new("badcfg");
+        let zero_ttl = Config::new("wist-ingest", dir.0.join("a.json")).max_ttl("read", 0);
+        assert!(Peer::open(zero_ttl).is_err());
+
+        let mut negative_skew = Config::new("wist-ingest", dir.0.join("b.json"));
+        negative_skew.clock_skew_seconds = -1;
+        assert!(Peer::open(negative_skew).is_err());
+    }
+
+    #[tokio::test]
+    async fn unsigned_register_is_rejected_when_signature_is_required() {
+        let dir = TempDir::new("sig-missing");
+        let (_, public) = keypair();
+        let app = signed_peer(&dir, public).router_with_verify();
+        let (status, body) = post(
+            app,
+            "/api/v1/internal/credentials",
+            Some(identity("wist-cred")),
+            json!(entry(1)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "credential_signature_invalid");
+    }
+
+    #[tokio::test]
+    async fn signed_register_is_accepted_and_revoke_needs_a_signature_too() {
+        let dir = TempDir::new("sig-ok");
+        let (private, public) = keypair();
+        let app = signed_peer(&dir, public).router_with_verify();
+
+        let (status, body) = post(
+            app.clone(),
+            "/api/v1/internal/credentials",
+            Some(identity("wist-cred")),
+            json!(signed_entry(1, &private)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // 撤销没带签名：拒。
+        let (status, body) = post(
+            app.clone(),
+            "/api/v1/internal/credentials/cred_1/revoke",
+            Some(identity("wist-cred")),
+            json!({ "revision": 2 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "credential_signature_invalid");
+
+        // 对“已撤销”的记录重新签名：通过。
+        let mut revoked = signed_entry(2, &private);
+        revoked.revoked_at = Some(now_secs());
+        revoked.signature = Some(sign(&revoked, &private).expect("sign"));
+        let (status, body) = post(
+            app,
+            "/api/v1/internal/credentials/cred_1/revoke",
+            Some(identity("wist-cred")),
+            json!({
+                "revision": 2,
+                "revoked_at": revoked.revoked_at,
+                "signature": revoked.signature,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["revision"], 2);
     }
 }
