@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- 示例 `peer-service` 移出本仓：它现在是一个**独立 crate**（`wist-cred-stack/dev/peer-example/`），
+  依赖走 crates.io 上已发布的 `wist-cred-peer` —— 这样示例演示的就是下游真实的接入形态，
+  而不是“库里自己跑自己”。
+
 ## [0.1.0] - 2026-11-03
 
 首个版本：把「验证方（X）接入 `wist-cred`」的实现抽成库，并给一个能直接跑起来的示例服务。

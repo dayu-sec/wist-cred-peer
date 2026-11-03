@@ -37,19 +37,20 @@ wist_cred_peer::serve(peer, "127.0.0.1:19443".parse()?, TlsFiles {
 
 ## 示例：一个真的能跑的服务
 
-```sh
-cargo run --example peer-service -- \
-  --listen 127.0.0.1:19443 \
-  --dir /etc/wist/wist-ingest \        # cred 的一次性接入命令落的材料
-  --store ./state/credentials.json \
-  --audience wist-ingest \
-  --issuer wist-cred \
-  --known-roles read,investigation:run \
-  --verify-endpoint                    # 仅联调：多挂一个 POST /verify
+不在本仓 —— 它作为一个**独立 crate** 放着，依赖走 crates.io 上已发布的 `wist-cred-peer`，
+这才是下游真实的接入形态：
+
+```
+wist-cred-stack/dev/peer-example/     # 依赖 wist-cred-peer = "0.1"
 ```
 
-起来之后把它打印的地址填回 cred 的收数地址即可。`--verify-endpoint` 那个路由
-**只用于联调**，生产别开（凭据的判定应该发生在业务请求里，不是让对端服务代验）。
+```sh
+cd wist-cred-stack
+./dev/svc.sh start peer      # 建系统 → 跑接入命令拿证书 → 起 mTLS 服务（:19455）
+./dev/svc.sh peer-check      # 签发 → 推送 → 本地验证 → 撤销 → 再验证
+```
+
+它演示的正是本 crate 的全部职责：收 register/revoke、自己的摘要表、双向认证、心跳。
 
 ## 契约
 
