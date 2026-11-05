@@ -120,8 +120,8 @@ impl Peer {
 
 /// 挂一个登录端点（`POST <base>`）。宿主自己决定挂在哪（console 是 `/api/login`）。
 ///
-/// 令牌可以放在 `Authorization: Bearer …`，也可以放在 JSON body 的 `{"token": "…"}`
-/// 里 —— 后者是表单式登录，前者是「已经拿着令牌，只想确认它是谁」。
+/// 令牌可以放在 JSON body 的 `{"token": "…"}`，也可以放在 `Authorization: Bearer …`；
+/// 两边都给时 **body 优先**（表单式登录是主路径，头是“已经拿着令牌，只想确认它是谁”）。
 pub fn router(peer: Arc<Peer>, required_roles: Vec<String>) -> Router {
     Router::new()
         .route("/login", post(login))
@@ -238,6 +238,84 @@ mod tests {
         assert_eq!(peer.login(None, &[]), Err(LoginError::Missing));
         assert_eq!(peer.login(Some("   "), &[]), Err(LoginError::Missing));
         assert_eq!(peer.login(Some("wcr_nope"), &[]), Err(LoginError::Invalid));
+    }
+
+    const TOKEN: &str = "wcr_login_test_token";
+
+    /// 走一次真实的推送入口，把一条授权记录放进摘要表。
+    ///
+    /// 不直接构造 store：登录端点的前提就是“凭证是 **register 进来**的”，
+    /// 绕开它测出来的东西不一定是现场的形状。
+    async fn register(peer: &Arc<Peer>, roles: &[&str]) {
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or(0);
+        let entry = wist_auth::credential::CredentialEntry {
+            credential_id: "cred_login".to_string(),
+            digest: format!("sha256:{}", wist_auth::sha256_hex(TOKEN)),
+            subject: "ops-zhangsan".to_string(),
+            roles: roles.iter().map(|role| role.to_string()).collect(),
+            resources: Default::default(),
+            audience: "wist-console".to_string(),
+            issued_at: now,
+            expires_at: now + 3_600,
+            revision: 1,
+            revoked_at: None,
+            signature: None,
+        };
+        let identity = wist_pki::PeerIdentity {
+            id: "wist-cred".to_string(),
+            uri: None,
+            cn: Some("wist-cred".to_string()),
+            fingerprint_sha256: "00".repeat(32),
+            serial_hex: "01".to_string(),
+            not_before: "2026-01-01T00:00:00Z".to_string(),
+            not_after: "2027-01-01T00:00:00Z".to_string(),
+        };
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(crate::DEFAULT_BASE_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&entry).expect("json")))
+            .expect("request");
+        request.extensions_mut().insert(identity);
+        let response = peer.router().oneshot(request).await.expect("register");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_registered_token_logs_in_with_its_identity() {
+        let dir = std::env::temp_dir().join(format!("peer-login-ok-{}", std::process::id()));
+        let peer = peer(&dir);
+        register(&peer, &["read"]).await;
+
+        let login = peer
+            .login(Some(TOKEN), &["read".to_string()])
+            .expect("login");
+        assert_eq!(login.subject, "ops-zhangsan");
+        assert_eq!(login.roles, vec!["read".to_string()]);
+        assert_eq!(login.audience, "wist-console");
+        assert_eq!(login.credential_id, "cred_login");
+        assert!(login.expires_at > 0, "expires_at 是 Unix 秒，不是毫秒");
+
+        // 空 `required_roles` = 只看令牌有效性，不看角色。
+        assert!(peer.login(Some(TOKEN), &[]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_valid_token_without_the_required_role_is_forbidden() {
+        let dir = std::env::temp_dir().join(format!("peer-login-role-{}", std::process::id()));
+        let peer = peer(&dir);
+        register(&peer, &["read"]).await;
+
+        assert_eq!(
+            peer.login(Some(TOKEN), &["admin".to_string()]),
+            Err(LoginError::RoleRequired),
+            "令牌有效但角色不够 → 403，不是 401"
+        );
     }
 
     #[tokio::test]
