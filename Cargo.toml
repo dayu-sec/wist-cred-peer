@@ -32,6 +32,14 @@ tokio-rustls = "0.26"
 # hyper 的 service_fn 要一个 Service；axum 的 Router 本身就实现了它。
 tower = { version = "0.5", features = ["util"] }
 
+# 自注册（初始化页）：本机生成密钥与 CSR。与 wist-pki 同一套原语。
+rcgen = { version = "0.13", features = ["pem"] }
+# 校验证书 SAN：必须含本机上报的主机名，否则 cred 连过来时握手必然失败。
+x509-parser = "0.16"
+# 调 cred 的 /enroll/{券}/{bundle,certificate}。
+# rustls 而不是 openssl：与镜像里的 `ubuntu:24.04` 不绑系统库。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
 [dev-dependencies]
 http-body-util = "0.1"
 # 测试里现生成 Ed25519 钥（与 `wist-auth/signing` 同一套原语）。

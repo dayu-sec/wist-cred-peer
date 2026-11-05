@@ -46,11 +46,13 @@
 mod api;
 mod config;
 mod error;
+mod init;
 mod peer;
 mod serve;
 
-pub use config::Config;
+pub use config::{Config, IdentityFiles, InitConfig};
 pub use error::{Error, Result};
+pub use init::{InitState, router as init_router, state as init_state};
 pub use peer::Peer;
 pub use serve::{TlsFiles, serve, serve_router};
 

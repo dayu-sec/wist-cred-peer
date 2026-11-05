@@ -33,6 +33,33 @@ pub struct Config {
     pub require_signature: bool,
     /// 信任的签发方 Ed25519 公钥（裸 32 字节）。空 = 一把都不信（fail-closed）。
     pub issuer_public_keys: Vec<Vec<u8>>,
+    /// 本服务在 cred 眼里的收数地址（部署事实）。
+    ///
+    /// 由**部署配置**渲染（如栈里的 `CREDENTIALS_BIND_IP/HOST_PORT`），不由命令行参数给。
+    pub publish_endpoint: Option<String>,
+    /// 未初始化时接受的注册配置；`None` = 本服务不支持自注册（不挂 `/__init`）。
+    pub init: Option<InitConfig>,
+    /// 注册产物落点。`None` = 不参与初始化流程。
+    pub identity: Option<IdentityFiles>,
+}
+
+/// 自注册（初始化页）的配置。
+#[derive(Debug, Clone)]
+pub struct InitConfig {
+    /// 初始化页必须提交的这个值：保护**对端** —— 否则任何人都能把服务指向自己的 cred 中心。
+    pub setup_code: String,
+    /// cred 的注册入口（`https://…:4444`）。预置后页面不再让操作者输入。
+    pub cred_url: Option<String>,
+    /// 接受自签入口的证书。只在首次注册时用；开了会大声告警（P1 换 `ca_file`）。
+    pub insecure_tls: bool,
+}
+
+/// 注册产物：服务器证书、私钥、客户端信任锚。
+#[derive(Debug, Clone)]
+pub struct IdentityFiles {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub client_ca: PathBuf,
 }
 
 impl Config {
@@ -51,7 +78,28 @@ impl Config {
             clock_skew_seconds: 60,
             require_signature: false,
             issuer_public_keys: Vec::new(),
+            publish_endpoint: None,
+            init: None,
+            identity: None,
         }
+    }
+
+    /// 本机在 cred 眼里的收数地址（部署配置渲染）。
+    pub fn publish_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.publish_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// 启用自注册：未初始化时暴露 `/__init`。
+    pub fn init(mut self, init: InitConfig) -> Self {
+        self.init = Some(init);
+        self
+    }
+
+    /// 注册产物的落点（证书 / 私钥 / 客户端信任锚）。
+    pub fn identity(mut self, files: IdentityFiles) -> Self {
+        self.identity = Some(files);
+        self
     }
 
     /// 放行签发方（客户端证书的身份）。不调用它就谁也推不进来。
