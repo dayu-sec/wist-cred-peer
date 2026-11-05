@@ -310,6 +310,9 @@ async fn enroll(
         .await
         .map_err(|err| unreachable(init, err))?;
     let status = bundle_response.status();
+    if status.is_redirection() {
+        return Err(redirected(status, &init_url(cred_url, ticket, "bundle")));
+    }
     // 在消费 body 之前取：这是“我到底连到了谁”的唯一硬证据。
     let cred_certificate_sha256 = peer_certificate_fingerprint(&bundle_response);
     let body = bundle_response
@@ -359,6 +362,12 @@ async fn enroll(
         .await
         .map_err(|err| unreachable(init, err))?;
     let status = enroll_response.status();
+    if status.is_redirection() {
+        return Err(redirected(
+            status,
+            &init_url(cred_url, ticket, "certificate"),
+        ));
+    }
     let body = enroll_response
         .text()
         .await
@@ -455,6 +464,9 @@ fn unreachable(init: &InitConfig, err: reqwest::Error) -> EnrollError {
 fn client(init: &InitConfig) -> Result<reqwest::Client, EnrollError> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
+        // **不跟随重定向**：券在 URL 里，跟一个 302 就等于把一次性券交给了重定向目标
+        // （入口配错、多一个斜杠就可能发生）。宁可失败，也不能静默转手。
+        .redirect(reqwest::redirect::Policy::none())
         // 拿得到对端证书才能把指纹摆给操作者核对。
         .tls_info(true);
     if let Some(ca_file) = &init.ca_file {
@@ -475,6 +487,23 @@ fn client(init: &InitConfig) -> Result<reqwest::Client, EnrollError> {
         .danger_accept_invalid_certs(init.insecure_tls && init.ca_file.is_none())
         .build()
         .map_err(|err| EnrollError::new("client_failed", format!("{err}")))
+}
+
+/// 注册客户端**不跟随重定向**：3xx 必须说清楚“为什么不跟”，而不是报成“cred 拒绝”。
+fn redirected(status: StatusCode, url: &str) -> EnrollError {
+    EnrollError::new(
+        "cred_redirected",
+        format!(
+            "cred answered {status} for {url}: the enrollment client does not follow redirects \
+             (the one-time ticket is in the URL — a redirect would hand it to whatever host it \
+             points at). Check the cred entry address (scheme / host / trailing slash)"
+        ),
+    )
+}
+
+/// 只给错误消息用：把券留在里面才好定位，但绝不写进日志。
+fn init_url(cred_url: &str, ticket: &str, tail: &str) -> String {
+    format!("{}/enroll/{ticket}/{tail}", cred_url.trim_end_matches('/'))
 }
 
 fn upstream_error(code: &'static str, status: StatusCode, body: &Value, raw: &str) -> EnrollError {
@@ -611,7 +640,7 @@ document.getElementById('f').addEventListener('submit', async (event) => {
     body: JSON.stringify(data),
   });
   out.textContent = await response.text();
-  if (response.ok) out.textContent += '\n\n完成：材料已落盘，收数监听会自动起来（无需重启）。\n核对 cred_certificate_sha256 与入口证书指纹一致再离开本页。';
+  if (response.ok) out.textContent += '\n\n完成：材料已落盘，收数监听会自动起来（无需重启）。\n若你是在服务**运行中**删掉材料后重新接入的，请重启本服务 —— 已加载的旧证书不会自行替换。\n核对 cred_certificate_sha256 与入口证书指纹一致再离开本页。';
 });
 </script>"#;
 
@@ -827,6 +856,41 @@ mod tests {
         assert!(!dir.join("server.crt").exists());
         assert!(!dir.join("server.key").exists());
         assert!(!dir.join("client-ca.pem").exists());
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_refused_instead_of_being_followed() {
+        // 入口配错（少一个斜杠 / http→https）时 cred 会回 3xx。券在 URL 里，
+        // 跟过去等于把一次性券交给了重定向目标 —— 所以注册客户端显式不跟，
+        // 而且错误要说清是“重定向”，不能报成“cred 拒绝”让人去查券。
+        let app = Router::new().route(
+            "/enroll/{token}/bundle",
+            get(|| async { (StatusCode::FOUND, [(header::LOCATION, "/elsewhere")]) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = temp_dir("redirect");
+        let peer = uninitialized(&dir);
+        let (status, body) = request(
+            router(peer),
+            "POST",
+            Some(json!({
+                "setup_code": "crp_test_setup_code",
+                "ticket": "wot_test",
+                "cred_url": format!("http://127.0.0.1:{}", addr.port()),
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"]["code"], "cred_redirected");
+        assert!(!dir.join("server.crt").exists());
     }
 
     #[tokio::test]
