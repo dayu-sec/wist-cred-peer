@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.4.0] - 2026-11-05
+
+### 新增：信任锚、入口证书指纹、材料齐备即起监听（P1）
+
+P0 让对端自己报地址；P1 要回答的是“我报给的到底是谁”。三件事一个主题：
+**别让“注册成功”变成一句无从核对的话。**
+
+- `InitConfig` 新增 `ca_file`：入口自签时的**信任锚**（PEM）。与 `insecure_tls` 互斥，
+  缺文件 / 同时配都在**加载期**拒 —— 不再留给运行期一个安静的坑。
+- 调 cred 的客户端开 `tls_info`：`/__init` 的成功响应里多一个
+  `cred_certificate_sha256`（注册时实际观察到的入口证书指纹）。没有信任锚的部署
+  （`insecure_tls = true`）必须把它和 `openssl s_client … -fingerprint -sha256` 对一遍：
+  否则“注册成功”只说明连到了**某个人**。
+- `serve_when_ready(peer, listen, files)`：三件材料齐了就自己起 mTLS，
+  **首次注册后不需要重启进程**。材料没齐时不先绑端口 —— 绑上只会让对端看到一个永远
+  握不上手的端口，比拒绝连接更难排查。响应里的 `restart_required` 随之变成 `false`。
+
+### 变更（跟行为有关的硬约束）
+
+- `publish_endpoint` 必须能取出主机名：`https://:18802/…` 这种未渲染的占位符现在
+  **拒启动**。证书 SAN 与 cred 拨号地址都来自它，占位符能签出证书、注册也“成功”，
+  坏在 cred 那侧握手。
+- 初始化页手填的 `host` 必须等于 `publish_endpoint` 的主机名（`host_mismatch`），
+  不再允许两者分叉。
+- 「连不上 cred」的错误带完整 source 链；证书不被信任时直接说该配 `ca_file`
+  还是确知跳过（`invalid peer certificate: UnknownIssuer` 原来只埋在链里）。
+
+### 测试
+
+26 → 31：真 TLS stub（CA 签的入口证书）验「配了锚就验过」「没锚被拒且提示 ca_file」
+「响应里的指纹与叶子证书 DER 对得上」，以及 `serve_when_ready` 材料出现前不监听、
+出现后自己起来。
+
+> 升级注意：`InitConfig` / `Config` 是公开结构体，本次新增了字段。用构造器的不受影响；
+> 用结构体字面量构造的需要补 `ca_file` —— 这是 0.3 → 0.4 的原因。
+
 ## [0.3.0] - 2026-11-05
 
 ### 新增：自注册与初始化（未初始化时只暴露 `/__init`）
