@@ -1,6 +1,6 @@
 [package]
 name = "wist-cred-peer"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Verifier-side (X) runtime for wist-cred: receive credential digests over mutual TLS and keep their own state"

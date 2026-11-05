@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.5.0] - 2026-11-05
+
+### 新增：登录端点（把访问令牌换成身份 + 角色）
+
+验证方（X）之前只有「接收推送」和「本地校验 token」两件事，**没有面向操作者的登录入口**：
+宿主只能在每个请求里自己比对 Bearer，界面上就只能“先发个真请求试试”，失败再按状态码猜原因。
+
+- `Peer::login(token, required_roles) -> Result<Login, LoginError>`：校验令牌 + **本宿主的
+  角色闸门**；`Login` 给出 `{credential_id, subject, roles, audience, expires_at}`（秒）；
+- `login_router(peer, required_roles)`：一个现成的 `POST /login`，令牌放 body
+  `{"token":"…"}` 或 `Authorization: Bearer …`（两边都给时 body 优先）；
+- 错误码是**对外契约**：401 `credential_missing` / `credential_invalid`、
+  403 `role_required`、503 `credential_store_unavailable`；
+- 口径与推送侧一致：不区分“不认识 / 过期 / 撤销 / audience 不符”（避免变成令牌枚举接口，
+  具体原因只进日志）；摘要表读不了是 503 而不是 401（别让人白去重新登录）。
+
+宿主需要显式挂它（`nest`/`merge` 到自己的路径），`router()` 的行为不变。
+
+用例 32 → 36（成功路径、角色不足、缺失/无效、HTTP 契约）。
+
+> 依赖新增 `log`（库里用 `log` 记账，落到哪由宿主决定）。
+
 ## [0.4.1] - 2026-11-05
 
 ### 修复
