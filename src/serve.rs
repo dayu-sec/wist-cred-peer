@@ -66,6 +66,31 @@ pub async fn serve_router(
     serve_listener(app, listener, config).await
 }
 
+/// 等身份材料齐备再起 mTLS 监听（首次注册后**不需要重启**）。
+///
+/// 初始化页是原子写盘（先 `.<name>.tmp` 再 rename），所以三件都在就是真的完整。
+/// 没就绪时**不绑端口**：没有服务器证书就绑上，只会让对端看到一个永远握不上手
+/// 的端口（比拒绝连接更难排查）。
+pub async fn serve_when_ready(peer: Arc<Peer>, listen: SocketAddr, files: TlsFiles) -> Result<()> {
+    if !ready(&files) {
+        eprintln!(
+            "waiting for identity materials before starting mTLS on {listen}: {} / {} / {}",
+            files.cert.display(),
+            files.key.display(),
+            files.client_ca.display()
+        );
+    }
+    while !ready(&files) {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    eprintln!("identity materials are in place; starting mTLS on {listen}");
+    serve(peer, listen, files).await
+}
+
+fn ready(files: &TlsFiles) -> bool {
+    files.cert.is_file() && files.key.is_file() && files.client_ca.is_file()
+}
+
 async fn serve_listener(
     app: Router,
     listener: tokio::net::TcpListener,

@@ -26,7 +26,16 @@
 //! 3. 本机生成密钥与 CSR（**私钥永不出本机**）；
 //! 4. `POST <cred>/enroll/<券>/certificate` 换服务器证书；
 //! 5. 校验返回物（SAN 含主机名 + 私钥与证书配对），原子落盘；
-//! 6. 提示重启（P0 不热加载：推送监听需要服务器证书，重启最不容易出错）。
+//! 6. 响应里 `restart_required: false`：宿主用 [`crate::serve_when_ready`] 等材料齐了
+//!    自己起 mTLS 监听，**不需要重启进程**。
+//!
+//! ## 传送门上的两个硬证据
+//!
+//! - `[init].ca_file`：入口自签时的**信任锚**。配了就不再靠人眼；
+//! - 响应里的 `cred_certificate_sha256`：注册时观察到的入口证书指纹。
+//!   没有信任锚的部署（`insecure_tls = true`）必须把它和
+//!   `openssl s_client -connect … -showcerts </dev/null | openssl x509 -fingerprint -sha256`
+//!   的输出对一遍 —— 否则“注册成功”只说明连到了**某个人**。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -187,18 +196,30 @@ async fn submit_init(State(peer): State<Arc<Peer>>, Json(body): Json<SubmitInit>
         );
     };
 
-    // 证书 SAN 必须等于 cred 以后要连的地址主机名；不给就按地址推导。
-    let host = match cleaned(body.host.as_deref()) {
-        Some(host) => Some(host.to_string()),
-        None => host_of(endpoint),
-    };
-    let Some(host) = host else {
+    // 证书 SAN 只能等于 cred 以后拨号的那个主机名：两者不一致时，证书能签出来、
+    // 注册也能“成功”，但 cred 一拨号就握手失败 —— 失败点在**对端**，最难查。
+    // 所以这里不留“随便填”的自由：地址里没有主机名就直接拒。
+    let Some(endpoint_host) = host_of(endpoint) else {
         return fail(
-            StatusCode::BAD_REQUEST,
-            "host_required",
-            "cannot derive the certificate host from [publish].endpoint; pass `host`",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "publish_endpoint_invalid",
+            "[publish].endpoint has no host (e.g. https://:18802/…): the deployment must \
+             render a real address — both the certificate SAN and cred's dial target come from it",
         );
     };
+    if let Some(given) = cleaned(body.host.as_deref())
+        && given != endpoint_host
+    {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "host_mismatch",
+            format!(
+                "host {given:?} does not match the host of [publish].endpoint ({endpoint_host:?}); \
+                 cred dials the endpoint, so the certificate must be issued for that name"
+            ),
+        );
+    }
+    let host = endpoint_host;
 
     let roles = body.roles.unwrap_or_else(|| config.known_roles.clone());
 
@@ -213,13 +234,15 @@ async fn submit_init(State(peer): State<Arc<Peer>>, Json(body): Json<SubmitInit>
     )
     .await
     {
-        Ok(files) => Json(json!({
+        Ok(registered) => Json(json!({
             "state": "initialized",
             "peer": config.audience,
             "host": host,
             "endpoint": endpoint,
-            "written": files,
-            "restart_required": true,
+            "written": registered.written,
+            // 让操作者拿这个和 `openssl s_client … -fingerprint -sha256` 对一下。
+            "cred_certificate_sha256": registered.cred_certificate_sha256,
+            "restart_required": false,
         }))
         .into_response(),
         Err(error) => fail(error.status(), error.code, error.message),
@@ -255,6 +278,13 @@ impl EnrollError {
     }
 }
 
+/// 注册成功的结果。
+struct Registered {
+    written: Vec<String>,
+    /// 注册时观察到的入口证书指纹（SHA-256 hex）：让操作者拿去比对。
+    cred_certificate_sha256: Option<String>,
+}
+
 /// 取 bundle → 生成密钥与 CSR → 换证书 → 校验 → 落盘。
 async fn enroll(
     init: &InitConfig,
@@ -264,7 +294,7 @@ async fn enroll(
     host: &str,
     endpoint: &str,
     roles: &[String],
-) -> Result<Vec<String>, EnrollError> {
+) -> Result<Registered, EnrollError> {
     let Some(files) = identity else {
         return Err(EnrollError::internal(
             "identity_paths_missing",
@@ -278,8 +308,10 @@ async fn enroll(
         .get(format!("{base}/enroll/{ticket}/bundle"))
         .send()
         .await
-        .map_err(|err| EnrollError::new("cred_unreachable", format!("{err}")))?;
+        .map_err(|err| unreachable(init, err))?;
     let status = bundle_response.status();
+    // 在消费 body 之前取：这是“我到底连到了谁”的唯一硬证据。
+    let cred_certificate_sha256 = peer_certificate_fingerprint(&bundle_response);
     let body = bundle_response
         .text()
         .await
@@ -325,7 +357,7 @@ async fn enroll(
         }))
         .send()
         .await
-        .map_err(|err| EnrollError::new("cred_unreachable", format!("{err}")))?;
+        .map_err(|err| unreachable(init, err))?;
     let status = enroll_response.status();
     let body = enroll_response
         .text()
@@ -375,19 +407,72 @@ async fn enroll(
         ));
     }
 
-    Ok(written
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect())
+    Ok(Registered {
+        written: written
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect(),
+        cred_certificate_sha256,
+    })
+}
+
+/// 入口证书的 SHA-256（小写 hex）：让操作者能把它和 `openssl s_client` 的输出对上。
+fn peer_certificate_fingerprint(response: &reqwest::Response) -> Option<String> {
+    let der = response
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()?
+        .peer_certificate()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, der);
+    let mut hex = String::with_capacity(64);
+    for byte in digest.as_ref() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Some(hex)
+}
+
+/// 「连不上 cred」不能只给一句 reqwest 原文：入口自签 + 没配信任锚是最常见的现场，
+/// 而它的报错（`invalid peer certificate: UnknownIssuer`）藏在 source 链里，也不会告诉你该配什么。
+fn unreachable(init: &InitConfig, err: reqwest::Error) -> EnrollError {
+    let mut message = err.to_string();
+    let mut source = std::error::Error::source(&err);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    // 只有「确实是证书不认」时才提信任锚：连接拒绝 / DNS 错不该被指到这里。
+    let certificate_problem = message.to_lowercase().contains("certificate");
+    if certificate_problem && init.ca_file.is_none() && !init.insecure_tls {
+        message.push_str(
+            " —— 本部署没有给入口配信任锚（[init].ca_file）。入口是自签证书时把它的 CA 放进 ca_file；\
+             只有在明确要跳过校验时才用 insecure_tls（然后用响应里的指纹人工核对）",
+        );
+    }
+    EnrollError::new("cred_unreachable", message)
 }
 
 fn client(init: &InitConfig) -> Result<reqwest::Client, EnrollError> {
-    let builder = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
-        // 入口通常是自签证书。P0 只有在部署显式打开时才接受；
-        // P1 会把这里换成 `[init].ca_file`（配信任锚，不靠人眼看指纹）。
-        .danger_accept_invalid_certs(init.insecure_tls);
+        // 拿得到对端证书才能把指纹摆给操作者核对。
+        .tls_info(true);
+    if let Some(ca_file) = &init.ca_file {
+        let pem = std::fs::read(ca_file).map_err(|err| {
+            EnrollError::internal(
+                "ca_file_unreadable",
+                format!("{}: {err}", ca_file.display()),
+            )
+        })?;
+        let cert = reqwest::Certificate::from_pem(&pem).map_err(|err| {
+            EnrollError::internal("ca_file_invalid", format!("{}: {err}", ca_file.display()))
+        })?;
+        builder = builder.add_root_certificate(cert);
+    }
     builder
+        // 入口通常是自签证书。只有**没配信任锚**时才能显式打开；
+        // 开了就必须把返回的指纹拿去和人手上的实例核对。
+        .danger_accept_invalid_certs(init.insecure_tls && init.ca_file.is_none())
         .build()
         .map_err(|err| EnrollError::new("client_failed", format!("{err}")))
 }
@@ -473,8 +558,11 @@ fn cleaned(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
-/// 从 `https://host:port/path` 取 `host`（与 cred 侧同一口径）。
-fn host_of(url: &str) -> Option<String> {
+/// 从收数地址里取主机名：`https://host:port/path` → `host`（IPv6 字面量去括号）。
+///
+/// `None` = 地址不成形：没有 `https://`（明文注册等于把 setup code 与一次性券摆到大街上）、
+/// 没有主机名（`https://:18802/…` 这种占位符没渲染）、或端口空。
+pub(crate) fn host_of(url: &str) -> Option<String> {
     let rest = url.strip_prefix("https://")?;
     let authority: String = rest
         .chars()
@@ -523,7 +611,7 @@ document.getElementById('f').addEventListener('submit', async (event) => {
     body: JSON.stringify(data),
   });
   out.textContent = await response.text();
-  if (response.ok) out.textContent += '\n\n完成：请重启本服务，让推送监听使用新证书。';
+  if (response.ok) out.textContent += '\n\n完成：材料已落盘，收数监听会自动起来（无需重启）。\n核对 cred_certificate_sha256 与入口证书指纹一致再离开本页。';
 });
 </script>"#;
 
@@ -573,8 +661,12 @@ mod tests {
     use tower::ServiceExt;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
+        // 计数器不能省：macOS 的 `SystemTime` 只到**微秒**，同一瞬间起的两个测试会撞同一纳秒值
+        // → 共用目录 → 一个测试的证书被另一个覆盖（表现为随机的 `BadSignature`）。
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wist-init-{tag}-{}-{}",
+            "wist-init-{tag}-{}-{}-{seq}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -586,18 +678,23 @@ mod tests {
     }
 
     fn uninitialized(dir: &std::path::Path) -> std::sync::Arc<Peer> {
-        let config = Config::new("wist-console", dir.join("credentials.json"))
-            .publish_endpoint("https://console.internal:18802/api/v1/internal/credentials")
-            .init(InitConfig {
+        with_init(
+            dir,
+            InitConfig {
                 setup_code: "crp_test_setup_code".to_string(),
                 cred_url: None,
+                ca_file: None,
                 insecure_tls: true,
-            })
-            .identity(IdentityFiles {
-                cert: dir.join("server.crt"),
-                key: dir.join("server.key"),
-                client_ca: dir.join("client-ca.pem"),
-            });
+            },
+        )
+    }
+
+    /// 未初始化 + 自定义 `[init]`（信任锚 / 不跳校验的用例要它）。
+    fn with_init(dir: &std::path::Path, init: InitConfig) -> std::sync::Arc<Peer> {
+        let config = Config::new("wist-console", dir.join("credentials.json"))
+            .publish_endpoint("https://console.internal:18802/api/v1/internal/credentials")
+            .init(init)
+            .identity(identity(dir));
         Peer::open(config).expect("peer")
     }
 
@@ -760,6 +857,7 @@ mod tests {
             .init(InitConfig {
                 setup_code: "   ".to_string(),
                 cred_url: None,
+                ca_file: None,
                 insecure_tls: false,
             });
         let err = match Peer::open(config) {
@@ -777,6 +875,7 @@ mod tests {
             .init(InitConfig {
                 setup_code: "crp_x".to_string(),
                 cred_url: None,
+                ca_file: None,
                 insecure_tls: false,
             });
         assert!(Peer::open(no_identity).is_err());
@@ -786,6 +885,7 @@ mod tests {
             .init(InitConfig {
                 setup_code: "crp_x".to_string(),
                 cred_url: None,
+                ca_file: None,
                 insecure_tls: false,
             });
         let err = match Peer::open(no_endpoint) {
@@ -796,6 +896,50 @@ mod tests {
     }
 
     // ── 错误文本截断：cred 的错误消息可能是中文 ──
+
+    #[test]
+    fn a_trust_anchor_and_insecure_tls_cannot_be_combined() {
+        let dir = temp_dir("bothca");
+        let ca = dir.join("ca.pem");
+        std::fs::write(
+            &ca,
+            "-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let config = Config::new("wist-console", dir.join("credentials.json"))
+            .publish_endpoint("https://console.internal:18802/api/v1/internal/credentials")
+            .identity(identity(&dir))
+            .init(InitConfig {
+                setup_code: "crp_x".to_string(),
+                cred_url: None,
+                ca_file: Some(ca),
+                insecure_tls: true,
+            });
+        let err = match Peer::open(config) {
+            Ok(_) => panic!("must refuse ca_file + insecure_tls"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_ca_file_is_refused_at_load_time() {
+        let dir = temp_dir("noca");
+        let config = Config::new("wist-console", dir.join("credentials.json"))
+            .publish_endpoint("https://console.internal:18802/api/v1/internal/credentials")
+            .identity(identity(&dir))
+            .init(InitConfig {
+                setup_code: "crp_x".to_string(),
+                cred_url: None,
+                ca_file: Some(dir.join("nope.pem")),
+                insecure_tls: false,
+            });
+        let err = match Peer::open(config) {
+            Ok(_) => panic!("must refuse a missing ca_file"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("ca_file"), "{err}");
+    }
 
     #[test]
     fn upstream_error_text_truncates_by_characters_not_bytes() {
@@ -819,10 +963,27 @@ mod tests {
         use wist_pki::CertificateAuthority;
 
         let (authority, ca_pem, _key) = CertificateAuthority::generate("Stub CA").expect("ca");
-        let authority = std::sync::Arc::new(authority);
-        let ca_for_bundle = ca_pem.clone();
+        let app = stub_cred_app(std::sync::Arc::new(authority), ca_pem);
 
-        let app = Router::new()
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    /// 同一套注册端点（明文）。TLS 版的 stub 复用它，只是外面包一层。
+    fn stub_cred_app(
+        authority: std::sync::Arc<wist_pki::CertificateAuthority>,
+        ca_pem: String,
+    ) -> Router {
+        use wist_pki::CertificateAuthority;
+
+        let ca_for_bundle = ca_pem;
+        Router::new()
             .route(
                 "/enroll/{token}/bundle",
                 get(move || {
@@ -853,16 +1014,117 @@ mod tests {
                     },
                 ),
             )
-            .with_state(authority);
+            .with_state(authority)
+    }
 
+    /// 一套真材料：CA + 它签的服务器证书 + 对应私钥。
+    struct Materials {
+        ca_pem: String,
+        cert_pem: String,
+        key_pem: String,
+    }
+
+    fn issue_materials(common_name: &str) -> Materials {
+        use wist_pki::CertificateAuthority;
+        wist_pki::tls::install_crypto_provider();
+
+        let (authority, ca_pem, _key) = CertificateAuthority::generate("Stub CA").expect("ca");
+        let (cert_pem, key_pem) = issue_with(&authority, common_name);
+        Materials {
+            ca_pem,
+            cert_pem,
+            key_pem,
+        }
+    }
+
+    /// 用给定的 CA 签一张服务器证书（返回证书 + 对应私钥 PEM）。
+    fn issue_with(
+        authority: &wist_pki::CertificateAuthority,
+        common_name: &str,
+    ) -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::default();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name.to_string());
+        let csr = params
+            .serialize_request(&key)
+            .expect("csr")
+            .pem()
+            .expect("csr pem");
+        let issued = authority
+            .issue_server_certificate(&csr, &[common_name.to_string()], 3600)
+            .expect("issue");
+        (issued.certificate_pem, key.serialize_pem())
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(text, "{byte:02x}");
+        }
+        text
+    }
+
+    /// 自签入口的 stub cred：真 TLS（rustls），证书由自己的 CA 签，CA 另行返回。
+    async fn stub_cred_tls() -> (
+        SocketAddr,
+        String, /*ca pem*/
+        String, /*leaf sha256*/
+    ) {
+        use std::sync::Arc;
+        use wist_pki::CertificateAuthority;
+
+        let (authority, ca_pem, _key) =
+            CertificateAuthority::generate("Stub Entry CA").expect("ca");
+        let authority = Arc::new(authority);
+        let app = stub_cred_app(Arc::clone(&authority), ca_pem.clone());
+
+        // 入口证书签给 `localhost`（reqwest 验证的是 URL 里的主机名），
+        // 而且**同一把 CA** 签：测试要的就是“配了这个锚就能验过”。
+        let (cert_pem, key_pem) = issue_with(&authority, "localhost");
+        let dir = temp_dir("entry-tls");
+        let cert = dir.join("entry.crt");
+        let key = dir.join("entry.key");
+        std::fs::write(&cert, &cert_pem).expect("cert");
+        std::fs::write(&key, &key_pem).expect("key");
+
+        // 期望的指纹：叶子证书 DER 的 SHA-256，与 reqwest 观察到的对端证书同口径。
+        let chain = wist_pki::tls::chain_from_pem(&cert_pem).expect("chain");
+        let leaf = hex(ring::digest::digest(&ring::digest::SHA256, chain[0].as_ref()).as_ref());
+
+        let config = wist_pki::tls::server_config(&cert, &key).expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
+
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            loop {
+                let Ok((stream, _peer)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let service = hyper::service::service_fn(move |request| {
+                        let app = app.clone();
+                        async move { tower::ServiceExt::oneshot(app, request).await }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .await;
+                });
+            }
         });
-        addr
+
+        (addr, ca_pem, leaf)
     }
 
     fn init_body(cred: SocketAddr) -> Value {
@@ -928,5 +1190,168 @@ mod tests {
             "exactly one submission may succeed: {:?} / {:?}",
             a.0, b.0
         );
+    }
+
+    // ── P1：信任锚 + 指纹 + 热加载 ──
+
+    #[tokio::test]
+    async fn a_trust_anchor_verifies_the_entry_and_reports_its_fingerprint() {
+        let (addr, ca_pem, leaf_sha256) = stub_cred_tls().await;
+        let dir = temp_dir("anchor");
+        let ca_file = dir.join("entry-ca.pem");
+        std::fs::write(&ca_file, &ca_pem).expect("ca file");
+
+        let peer = with_init(
+            &dir,
+            InitConfig {
+                setup_code: "crp_test_setup_code".to_string(),
+                cred_url: None,
+                ca_file: Some(ca_file),
+                insecure_tls: false,
+            },
+        );
+        let (status, body) = request(
+            router(peer),
+            "POST",
+            Some(json!({
+                "setup_code": "crp_test_setup_code",
+                "ticket": "wot_test",
+                "cred_url": format!("https://localhost:{}", addr.port()),
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // 不需要重启：宿主用 serve_when_ready 自己起来。
+        assert_eq!(body["restart_required"], false);
+        // 指纹必须是真的（跟签出来的叶子证书 DER 对得上），不是个占位符。
+        assert_eq!(body["cred_certificate_sha256"], leaf_sha256);
+        assert!(dir.join("server.crt").is_file());
+        assert!(dir.join("client-ca.pem").is_file());
+    }
+
+    #[tokio::test]
+    async fn without_a_trust_anchor_a_self_signed_entry_is_refused() {
+        let (addr, _ca_pem, _leaf) = stub_cred_tls().await;
+        let dir = temp_dir("noanchor");
+        let peer = with_init(
+            &dir,
+            InitConfig {
+                setup_code: "crp_test_setup_code".to_string(),
+                cred_url: None,
+                ca_file: None,
+                insecure_tls: false,
+            },
+        );
+        let (status, body) = request(
+            router(peer),
+            "POST",
+            Some(json!({
+                "setup_code": "crp_test_setup_code",
+                "ticket": "wot_test",
+                "cred_url": format!("https://localhost:{}", addr.port()),
+            })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["error"]["code"], "cred_unreachable");
+        // 错误里要说清“该配什么”，而不是只照抄 reqwest 的原文。
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("ca_file"), "{message}");
+        // 任何一步失败都不落材料。
+        assert!(!dir.join("server.crt").exists());
+        assert!(!dir.join("server.key").exists());
+        assert!(!dir.join("client-ca.pem").exists());
+    }
+
+    #[test]
+    fn a_publish_endpoint_without_a_host_is_a_config_error() {
+        let dir = temp_dir("badendpoint");
+        let config = Config::new("wist-console", dir.join("credentials.json"))
+            // 栈没渲染 `CONSOLE_ADVERTISE_HOST` 时就是这个形状。
+            .publish_endpoint("https://:18802/api/v1/internal/credentials")
+            .identity(identity(&dir))
+            .init(InitConfig {
+                setup_code: "crp_x".to_string(),
+                cred_url: None,
+                ca_file: None,
+                insecure_tls: false,
+            });
+        let err = match Peer::open(config) {
+            Ok(_) => panic!("endpoint without a host must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("no usable host"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_host_that_differs_from_the_endpoint_is_refused() {
+        let dir = temp_dir("hostmismatch");
+        let peer = uninitialized(&dir);
+        let (status, body) = request(
+            router(peer),
+            "POST",
+            Some(json!({
+                "setup_code": "crp_test_setup_code",
+                "ticket": "wot_x",
+                // 地址里的主机名是 console.internal；证书却要签给别的名字
+                // → cred 一拨号就握手失败。宁可在这一步拦住。
+                "host": "other.internal",
+                "cred_url": "https://127.0.0.1:1",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "host_mismatch");
+        assert!(!dir.join("server.crt").exists());
+    }
+
+    #[tokio::test]
+    async fn serve_when_ready_listens_only_after_the_materials_appear() {
+        // 先借一个空闲端口（绑后立刻放开），好断言“材料没齐时没人监听”。
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe");
+        let listen = probe.local_addr().expect("addr");
+        drop(probe);
+
+        let dir = temp_dir("hotstart");
+        let files = identity(&dir);
+        let peer = uninitialized(&dir);
+        let task = tokio::spawn(crate::serve::serve_when_ready(
+            peer,
+            listen,
+            crate::serve::TlsFiles {
+                cert: files.cert.clone(),
+                key: files.key.clone(),
+                client_ca: files.client_ca.clone(),
+            },
+        ));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            tokio::net::TcpStream::connect(listen).await.is_err(),
+            "must not bind before the materials exist"
+        );
+
+        let materials = issue_materials("console.internal");
+        std::fs::write(&files.cert, &materials.cert_pem).expect("cert");
+        std::fs::write(&files.key, &materials.key_pem).expect("key");
+        std::fs::write(&files.client_ca, &materials.ca_pem).expect("ca");
+
+        let mut listening = false;
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(listen).await.is_ok() {
+                listening = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            listening,
+            "the mTLS listener must come up once the materials are in place"
+        );
+        task.abort();
     }
 }

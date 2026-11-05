@@ -77,6 +77,33 @@ impl Peer {
                         .into(),
                 ));
             }
+            // 空地址上面已经拒了；这里拒「渲染了但没主机名」的占位符（`https://:18802/…`）。
+            // 这种地址在初始化页上不会自己暴露：能签出一张签给 `""` 的证书、
+            // 也能“注册成功”，到 cred 拨号时才发现握手不过。
+            if let Some(endpoint) = config.publish_endpoint.as_deref()
+                && crate::init::host_of(endpoint.trim()).is_none()
+            {
+                return Err(Error::Config(format!(
+                    "publish_endpoint {:?} has no usable host: cred dials this address and the \
+                     certificate SAN is taken from it, so a placeholder is not acceptable",
+                    endpoint.trim()
+                )));
+            }
+            if init.insecure_tls && init.ca_file.is_some() {
+                return Err(Error::Config(
+                    "init.ca_file and init.insecure_tls are mutually exclusive: pick a trust anchor \
+                     or knowingly skip verification, not both"
+                        .into(),
+                ));
+            }
+            if let Some(ca_file) = &init.ca_file
+                && !ca_file.is_file()
+            {
+                return Err(Error::Config(format!(
+                    "init.ca_file {} does not exist",
+                    ca_file.display()
+                )));
+            }
         }
         // 上限 <= 0 会让凭据一登记就过期；这是配置错，不是运行时问题。
         if let Some((role, seconds)) = config

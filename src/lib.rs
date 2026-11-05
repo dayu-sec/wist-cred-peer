@@ -54,7 +54,7 @@ pub use config::{Config, IdentityFiles, InitConfig};
 pub use error::{Error, Result};
 pub use init::{InitState, router as init_router, state as init_state};
 pub use peer::Peer;
-pub use serve::{TlsFiles, serve, serve_router};
+pub use serve::{TlsFiles, serve, serve_router, serve_when_ready};
 
 /// 契约里默认的接收路径（`register` = `POST <base>`，`revoke` = `POST <base>/{id}/revoke`）。
 pub const DEFAULT_BASE_PATH: &str = "/api/v1/internal/credentials";

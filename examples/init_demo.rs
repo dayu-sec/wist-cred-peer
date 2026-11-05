@@ -75,7 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init(InitConfig {
             setup_code,
             cred_url: env("WIST_PEER_CRED_URL"),
-            // 默认**不接受**自签证书：要接自签入口必须显式打开（P1 换 ca_file）。
+            // 信任锚（入口的自签 CA）；配了就不用 `insecure_tls`。
+            ca_file: env("WIST_PEER_CA_FILE").map(Into::into),
+            // 默认**不接受**自签证书；没 CA 时才显式打开（并把返回的指纹拿去核对）。
             insecure_tls: env("WIST_PEER_INSECURE_TLS").as_deref() == Some("1"),
         })
         .allow_issuer("wist-cred")
@@ -90,20 +92,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let peer = Peer::open(config)?;
 
+    // mTLS 监听交给 `serve_when_ready`：未初始化时它在等，注册写完材料就自己起来，
+    // 不需要重启（P1 的热加载）。
+    let listen = listen_addr_for(&endpoint)?;
+    let tls_files = TlsFiles {
+        cert: identity.cert.clone(),
+        key: identity.key.clone(),
+        client_ca: identity.client_ca.clone(),
+    };
+    let mtls = tokio::spawn(wist_cred_peer::serve_when_ready(
+        peer.clone(),
+        listen,
+        tls_files,
+    ));
+
     if wist_cred_peer::init_state(peer.config()) == InitState::Initialized {
-        let addr = listen_addr_for(&endpoint)?;
-        println!("已初始化：在 {addr} 上起 mTLS 推送监听（{endpoint}）");
-        return wist_cred_peer::serve(
-            peer,
-            addr,
-            TlsFiles {
-                cert: identity.cert,
-                key: identity.key,
-                client_ca: identity.client_ca,
-            },
-        )
-        .await
-        .map_err(Into::into);
+        println!("已初始化：mTLS 推送监听在 {listen}（{endpoint}）");
+        return mtls.await?.map_err(Into::into);
     }
 
     let for_health = peer.clone();
@@ -121,9 +126,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
 
-    println!("未初始化：初始化页 http://{http_addr}/__init");
+    println!(
+        "未初始化：初始化页 http://{http_addr}/__init（注册成功后 mTLS 监听会在 {listen} 上自动起来）"
+    );
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
-    axum::serve(listener, app).await?;
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            result?;
+        }
+        result = mtls => {
+            result??;
+        }
+    }
     Ok(())
 }
 

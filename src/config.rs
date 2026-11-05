@@ -50,7 +50,10 @@ pub struct InitConfig {
     pub setup_code: String,
     /// cred 的注册入口（`https://…:4444`）。预置后页面不再让操作者输入。
     pub cred_url: Option<String>,
-    /// 接受自签入口的证书。只在首次注册时用；开了会大声告警（P1 换 `ca_file`）。
+    /// 信任锚：入口的自签 CA（PEM）。配了就不再靠人眼看指纹。
+    pub ca_file: Option<PathBuf>,
+    /// 接受自签入口的证书。**与 `ca_file` 互斥**；只在没有信任锚的首次注册时用，
+    /// 而且要把页面上观察到的指纹拿去人工核对。
     pub insecure_tls: bool,
 }
 

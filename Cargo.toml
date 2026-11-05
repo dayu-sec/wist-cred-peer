@@ -27,6 +27,8 @@ wist-pki = "0.1.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 计算对端（入口）证书指纹：初始化页要把“我连到的到底是谁”摆给操作者核对。
+ring = "0.17"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
 tokio-rustls = "0.26"
 # hyper 的 service_fn 要一个 Service；axum 的 Router 本身就实现了它。
@@ -42,5 +44,3 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [dev-dependencies]
 http-body-util = "0.1"
-# 测试里现生成 Ed25519 钥（与 `wist-auth/signing` 同一套原语）。
-ring = "0.17"
