@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.3.0] - 2026-11-05
+
+### 新增：自注册与初始化（未初始化时只暴露 `/__init`）
+
+收数地址是**对端的部署事实**（端口映射、反代、DNS），cred 那边抄不对，命令行参数又不可信。
+现在由服务自己在首次启动时报上来，但必须同时具备两个**独立**的授权：
+
+- `[init].setup_code` 保护**本服务**：否则谁都能把它指向自己的 cred 中心、再给自己签 token；
+- 一次性券（`wot_…`，cred 页面签发）保护 **cred**：否则谁都能注册成认证系统。
+
+API：
+
+- `Config` 新增 `publish_endpoint` / `init(InitConfig)` / `identity(IdentityFiles)`；
+- `InitState` + `init_state(config)` + `init_router(peer)`：
+  `GET /__init`（JSON / 自包含 HTML）、`POST /__init`（一次提交完成注册）；
+- POST 顺序：常数时间校验 setup code → `GET <cred>/enroll/<券>/bundle` →
+  本机生成密钥与 CSR → `POST <cred>/enroll/<券>/certificate` →
+  校验 SAN 与私钥配对 → **原子落盘**；任何一步失败都不落材料；
+- `examples/init_demo.rs`：最小宿主（未初始化跑初始化页，初始化后跑 mTLS 推送监听）。
+
+三处刻意的硬约束：
+
+- **配置期就拒**：空 setup code、开了 init 却没 identity 路径、或没 publish endpoint；
+- **并发只允许一次**：闸门挂在 `Peer` 上，两个提交不会各换一张证书；
+- **不热加载**：写完材料提示重启，由宿主重新起 mTLS 监听。
+
+> 升级注意：`Config` 是公开结构体，本次新增了字段。用 `Config::new(...)` + 构造器的不受影响；
+> 用结构体字面量构造的需要补字段 —— 这是 0.2 → 0.3 的原因。
+
 ## [0.2.0] - 2026-11-03
 
 ### Added（授权记录验签）
