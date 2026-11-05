@@ -75,7 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init(InitConfig {
             setup_code,
             cred_url: env("WIST_PEER_CRED_URL"),
-            insecure_tls: env("WIST_PEER_INSECURE_TLS").as_deref() != Some("0"),
+            // 默认**不接受**自签证书：要接自签入口必须显式打开（P1 换 ca_file）。
+            insecure_tls: env("WIST_PEER_INSECURE_TLS").as_deref() == Some("1"),
         })
         .allow_issuer("wist-cred")
         .known_roles(roles);

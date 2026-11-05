@@ -15,6 +15,10 @@ use crate::error::{Error, Result};
 pub struct Peer {
     config: Arc<Config>,
     store: CredentialStore,
+    /// 初始化闸门：**跟着进程（Peer）走**，不跟着 router 走 ——
+    /// 同一个 Peer 可能被构建出多个 router（测试、多端口挂载），而"只允许初始化一次"
+    /// 是进程级不变量。
+    init_gate: tokio::sync::Mutex<()>,
 }
 
 impl Peer {
@@ -43,6 +47,37 @@ impl Peer {
                 "clock_skew_seconds must not be negative".into(),
             ));
         }
+        // 自注册的三件前提必须是**配置期**成立的：
+        // 否则要么什么人都能初始化（空 setup code），要么初始化必然失败（缺落点/缺地址）。
+        if let Some(init) = &config.init {
+            if init.setup_code.trim().is_empty() {
+                return Err(Error::Config(
+                    "init.setup_code must not be empty: an empty code lets anyone point this \
+                     service at their own cred center"
+                        .into(),
+                ));
+            }
+            if config.identity.is_none() {
+                return Err(Error::Config(
+                    "init is enabled but identity paths are missing (nothing to write the \
+                     registration materials to)"
+                        .into(),
+                ));
+            }
+            if config
+                .publish_endpoint
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            {
+                return Err(Error::Config(
+                    "init is enabled but publish_endpoint is missing: the peer must report the \
+                     address cred will dial, and that value comes from the deployment config"
+                        .into(),
+                ));
+            }
+        }
         // 上限 <= 0 会让凭据一登记就过期；这是配置错，不是运行时问题。
         if let Some((role, seconds)) = config
             .max_ttl_by_role
@@ -67,6 +102,7 @@ impl Peer {
 
         Ok(Arc::new(Self {
             config: Arc::new(config),
+            init_gate: tokio::sync::Mutex::new(()),
             store,
         }))
     }
@@ -100,6 +136,11 @@ impl Peer {
 
     pub(crate) fn store(&self) -> &CredentialStore {
         &self.store
+    }
+
+    /// 初始化闸门（见字段注释）。
+    pub(crate) fn init_gate(&self) -> &tokio::sync::Mutex<()> {
+        &self.init_gate
     }
 
     /// 本地校验一条 token。`audience` 用本服务的名字，不需要调用方再传。

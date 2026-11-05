@@ -27,7 +27,7 @@ wist-pki = "0.1.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "sync"] }
 tokio-rustls = "0.26"
 # hyper 的 service_fn 要一个 Service；axum 的 Router 本身就实现了它。
 tower = { version = "0.5", features = ["util"] }

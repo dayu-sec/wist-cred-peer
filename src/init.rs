@@ -130,6 +130,9 @@ struct SubmitInit {
 }
 
 async fn submit_init(State(peer): State<Arc<Peer>>, Json(body): Json<SubmitInit>) -> Response {
+    // 先拿门再读状态：否则两个并发请求会同时看到 uninitialized，
+    // 各自换一张证书，后写的那份把前一份的私钥盖掉。
+    let _guard = peer.init_gate().lock().await;
     let config = peer.config();
 
     if state(config) == InitState::Initialized {
@@ -219,13 +222,15 @@ async fn submit_init(State(peer): State<Arc<Peer>>, Json(body): Json<SubmitInit>
             "restart_required": true,
         }))
         .into_response(),
-        Err(error) => fail(StatusCode::BAD_GATEWAY, error.code, error.message),
+        Err(error) => fail(error.status(), error.code, error.message),
     }
 }
 
 struct EnrollError {
     code: &'static str,
     message: String,
+    /// 该回给调用方的状态码：内部错不能伪装成「上游拒绝」。
+    status: StatusCode,
 }
 
 impl EnrollError {
@@ -233,7 +238,20 @@ impl EnrollError {
         Self {
             code,
             message: message.into(),
+            status: StatusCode::BAD_GATEWAY,
         }
+    }
+
+    fn internal(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn status(&self) -> StatusCode {
+        self.status
     }
 }
 
@@ -248,7 +266,7 @@ async fn enroll(
     roles: &[String],
 ) -> Result<Vec<String>, EnrollError> {
     let Some(files) = identity else {
-        return Err(EnrollError::new(
+        return Err(EnrollError::internal(
             "identity_paths_missing",
             "this deployment has no [identity] paths configured",
         ));
@@ -262,12 +280,15 @@ async fn enroll(
         .await
         .map_err(|err| EnrollError::new("cred_unreachable", format!("{err}")))?;
     let status = bundle_response.status();
-    let bundle: Value = bundle_response
-        .json()
+    let body = bundle_response
+        .text()
         .await
         .map_err(|err| EnrollError::new("cred_unreachable", format!("bundle: {err}")))?;
+    // 入口挂了时返回的是 nginx 的 HTML，不是 JSON：按文本读再试解析，
+    // 否则会报一个误导人的 `cred_unreachable`。
+    let bundle: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(upstream_error("bundle_rejected", status, &bundle));
+        return Err(upstream_error("bundle_rejected", status, &bundle, &body));
     }
     let client_ca_pem = bundle
         .get("client_ca_pem")
@@ -371,22 +392,20 @@ fn client(init: &InitConfig) -> Result<reqwest::Client, EnrollError> {
         .map_err(|err| EnrollError::new("client_failed", format!("{err}")))
 }
 
-fn upstream_error(code: &'static str, status: StatusCode, body: &Value) -> EnrollError {
+fn upstream_error(code: &'static str, status: StatusCode, body: &Value, raw: &str) -> EnrollError {
     let upstream = body
         .get("error")
         .and_then(|error| error.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or("unknown");
-    EnrollError::new(code, format!("cred refused ({status}): {upstream}"))
+        .and_then(Value::as_str);
+    match upstream {
+        Some(upstream) => EnrollError::new(code, format!("cred refused ({status}): {upstream}")),
+        None => upstream_error_text(code, status, raw),
+    }
 }
 
 fn upstream_error_text(code: &'static str, status: StatusCode, body: &str) -> EnrollError {
-    let detail = body.trim();
-    let detail = if detail.len() > 300 {
-        &detail[..300]
-    } else {
-        detail
-    };
+    // 按字符截断：响应体可能是中文（cred 的错误消息），按字节切会直接 panic。
+    let detail: String = body.trim().chars().take(300).collect();
     EnrollError::new(code, format!("cred refused ({status}): {detail}"))
 }
 
@@ -412,17 +431,25 @@ fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), EnrollErr
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).map_err(|err| {
-            EnrollError::new("write_failed", format!("{}: {err}", parent.display()))
+            EnrollError::internal("write_failed", format!("{}: {err}", parent.display()))
         })?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, contents)
-        .map_err(|err| EnrollError::new("write_failed", format!("{}: {err}", tmp.display())))?;
+    // 临时文件名带上原文件名：`server.crt` 与 `server.key` 的 `with_extension` 都叫 `server.tmp`，
+    // 一旦两个写入交叠（或失败留下残骸），就会把另一份材料蓋掉。
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "identity".to_string());
+    let tmp = path.with_file_name(format!(".{name}.tmp"));
+    std::fs::write(&tmp, contents).map_err(|err| {
+        EnrollError::internal("write_failed", format!("{}: {err}", tmp.display()))
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-            .map_err(|err| EnrollError::new("write_failed", format!("{}: {err}", tmp.display())))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(|err| {
+            EnrollError::internal("write_failed", format!("{}: {err}", tmp.display()))
+        })?;
     }
     std::fs::rename(&tmp, path)
         .map_err(|err| EnrollError::new("write_failed", format!("{}: {err}", path.display())))
@@ -453,11 +480,21 @@ fn host_of(url: &str) -> Option<String> {
         .chars()
         .take_while(|character| !matches!(character, '/' | '?' | '#'))
         .collect();
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority.as_str(), |(h, _)| h);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    (!host.is_empty()).then(|| host.to_string())
+    // IPv6 字面量必须先按括号取，再谈端口：`[::1]` 按 ':' 切会得到 `[:`。
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (inside, after) = rest.split_once(']')?;
+        (inside, after.strip_prefix(':'))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority.as_str(), None),
+        }
+    };
+    let host = host.trim();
+    if host.is_empty() || port.is_some_and(|port| port.is_empty()) {
+        return None;
+    }
+    Some(host.to_string())
 }
 
 fn fail(status: StatusCode, code: &'static str, message: impl Into<String>) -> Response {
@@ -530,7 +567,9 @@ fn page(state: InitState, audience: &str, preset_url: &str) -> String {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::routing::post;
     use http_body_util::BodyExt;
+    use std::net::SocketAddr;
     use tower::ServiceExt;
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -604,6 +643,25 @@ mod tests {
             Some("console.internal")
         );
         assert_eq!(host_of("http://console.internal/x"), None);
+        // IPv6 字面量：先按括号取，再谈端口。
+        assert_eq!(host_of("https://[::1]:19499/x").as_deref(), Some("::1"));
+        assert_eq!(host_of("https://[::1]/x").as_deref(), Some("::1"));
+        // 空的端口 / 空主机都不是合法地址。
+        assert_eq!(host_of("https://host:/x"), None);
+        assert_eq!(host_of("https:///x"), None);
+    }
+
+    #[test]
+    fn an_html_upstream_error_is_reported_instead_of_being_called_unreachable() {
+        // 入口挂掉时回的是 nginx 的 HTML，不是 JSON —— 不能因此说“连不上 cred”。
+        let err = upstream_error(
+            "bundle_rejected",
+            StatusCode::BAD_GATEWAY,
+            &Value::Null,
+            "<html><body>502 Bad Gateway</body></html>",
+        );
+        assert_eq!(err.code, "bundle_rejected");
+        assert!(err.message.contains("502 Bad Gateway"), "{}", err.message);
     }
 
     #[test]
@@ -689,5 +747,186 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["error"]["code"], "already_initialized");
+    }
+
+    // ── 配置期就该拒的东西（否则运行期只有一个安静的坑）──
+
+    #[test]
+    fn an_empty_setup_code_is_a_config_error() {
+        let dir = temp_dir("emptycode");
+        let config = Config::new("wist-console", dir.join("credentials.json"))
+            .publish_endpoint("https://console.internal:18802/api/v1/internal/credentials")
+            .identity(identity(&dir))
+            .init(InitConfig {
+                setup_code: "   ".to_string(),
+                cred_url: None,
+                insecure_tls: false,
+            });
+        let err = match Peer::open(config) {
+            Ok(_) => panic!("empty setup code must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("setup_code"), "{err}");
+    }
+
+    #[test]
+    fn init_without_paths_or_endpoint_is_refused() {
+        let dir = temp_dir("nopaths");
+        let no_identity = Config::new("wist-console", dir.join("credentials.json"))
+            .publish_endpoint("https://console.internal:18802/api/v1/internal/credentials")
+            .init(InitConfig {
+                setup_code: "crp_x".to_string(),
+                cred_url: None,
+                insecure_tls: false,
+            });
+        assert!(Peer::open(no_identity).is_err());
+
+        let no_endpoint = Config::new("wist-console", dir.join("credentials.json"))
+            .identity(identity(&dir))
+            .init(InitConfig {
+                setup_code: "crp_x".to_string(),
+                cred_url: None,
+                insecure_tls: false,
+            });
+        let err = match Peer::open(no_endpoint) {
+            Ok(_) => panic!("missing endpoint must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("publish_endpoint"), "{err}");
+    }
+
+    // ── 错误文本截断：cred 的错误消息可能是中文 ──
+
+    #[test]
+    fn upstream_error_text_truncates_by_characters_not_bytes() {
+        let body = "错误".repeat(400);
+        let err = upstream_error_text("enroll_rejected", StatusCode::BAD_REQUEST, &body);
+        assert!(err.message.chars().count() < 400);
+        assert!(err.message.contains("错误"));
+    }
+
+    // ── 端到端：stub cred（真签证书）+ 并发提交 ──
+
+    fn identity(dir: &std::path::Path) -> IdentityFiles {
+        IdentityFiles {
+            cert: dir.join("server.crt"),
+            key: dir.join("server.key"),
+            client_ca: dir.join("client-ca.pem"),
+        }
+    }
+
+    async fn stub_cred() -> SocketAddr {
+        use wist_pki::CertificateAuthority;
+
+        let (authority, ca_pem, _key) = CertificateAuthority::generate("Stub CA").expect("ca");
+        let authority = std::sync::Arc::new(authority);
+        let ca_for_bundle = ca_pem.clone();
+
+        let app = Router::new()
+            .route(
+                "/enroll/{token}/bundle",
+                get(move || {
+                    let client_ca = ca_for_bundle.clone();
+                    async move {
+                        Json(json!({
+                            "peer": "wist-console",
+                            "client_ca_pem": client_ca,
+                            "issuer_signing_pub": null,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/enroll/{token}/certificate",
+                post(
+                    |State(authority): State<std::sync::Arc<CertificateAuthority>>,
+                     Json(body): Json<Value>| async move {
+                        let csr = body["certificate_signing_request"]
+                            .as_str()
+                            .expect("csr")
+                            .to_string();
+                        let host = body["host"].as_str().expect("host").to_string();
+                        match authority.issue_server_certificate(&csr, &[host], 3600) {
+                            Ok(issued) => (StatusCode::OK, issued.certificate_pem),
+                            Err(error) => (StatusCode::BAD_REQUEST, error),
+                        }
+                    },
+                ),
+            )
+            .with_state(authority);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    fn init_body(cred: SocketAddr) -> Value {
+        json!({
+            "setup_code": "crp_test_setup_code",
+            "ticket": "wot_test",
+            "cred_url": format!("http://{cred}"),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_full_self_registration_writes_usable_materials() {
+        let cred = stub_cred().await;
+        let dir = temp_dir("e2e");
+        let peer = uninitialized(&dir);
+        let (status, body) = request(router(peer), "POST", Some(init_body(cred))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "initialized");
+        assert_eq!(body["host"], "console.internal");
+
+        let cert = std::fs::read_to_string(dir.join("server.crt")).expect("cert");
+        let key = std::fs::read_to_string(dir.join("server.key")).expect("key");
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(key.contains("PRIVATE KEY"));
+        assert!(
+            dir.join("client-ca.pem").is_file(),
+            "client CA must be written"
+        );
+        // 私钥只能自己可读。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("server.key"))
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "mode {mode:o}");
+        }
+        // 证书确实覆盖了上报的主机名。
+        assert!(certificate_covers(&cert, "console.internal"));
+        // 私钥与证书配对（重新加载一次）。
+        wist_pki::tls::install_crypto_provider();
+        assert!(
+            wist_pki::tls::server_config(&dir.join("server.crt"), &dir.join("server.key")).is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_submissions_enroll_only_once() {
+        let cred = stub_cred().await;
+        let dir = temp_dir("race");
+        let peer = uninitialized(&dir);
+        let first = router(peer.clone());
+        let second = router(peer);
+        let (a, b) = tokio::join!(
+            request(first, "POST", Some(init_body(cred))),
+            request(second, "POST", Some(init_body(cred))),
+        );
+        let ok = usize::from(a.0 == StatusCode::OK) + usize::from(b.0 == StatusCode::OK);
+        assert_eq!(
+            ok, 1,
+            "exactly one submission may succeed: {:?} / {:?}",
+            a.0, b.0
+        );
     }
 }
