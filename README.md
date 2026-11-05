@@ -35,6 +35,44 @@ wist_cred_peer::serve(peer, "127.0.0.1:19443".parse()?, TlsFiles {
 把 `Peer::router()` merge 进去，并在请求上注入 `Extension<wist_pki::PeerIdentity>`
 （握手层拿到的客户端身份）。路由本身不认识 TLS。
 
+## 自注册与初始化（P0）
+
+服务第一次启动时**没有任何材料**，无法起 mTLS 推送监听。`init` 模块把这套流程收在库里：
+
+| 状态 | 判据 | 行为 |
+|---|---|---|
+| `uninitialized` | 没有 `server.crt` / `key` / `client-ca.pem` | 挂 `init_router(peer)`，它提供 `GET/POST /__init` |
+| `initialized` | 三件齐全 | `/__init` → `409`；宿主照常起 `serve(...)` |
+
+两条**互相独立**的授权，缺一条都能被打穿：
+
+- `[init].setup_code` 保护**本服务**：否则谁都能把它指向自己的 cred 中心、再给自己签 token；
+- 一次性券（`wot_…`，cred 页面签发）保护 **cred**：否则谁都能注册成认证系统。
+
+```rust
+use wist_cred_peer::{Config, IdentityFiles, InitConfig};
+
+let config = Config::new("wist-console", "/var/lib/wist-console/credentials.json")
+    // 收数地址来自部署配置（栈按端口映射渲染），不由命令行参数给。
+    .publish_endpoint("https://console.internal:18802/api/v1/internal/credentials")
+    .identity(IdentityFiles {
+        cert: "/cred/server.crt".into(),
+        key: "/cred/server.key".into(),
+        client_ca: "/cred/client-ca.pem".into(),
+    })
+    .init(InitConfig {
+        setup_code: std::env::var("CRED_PEER_SETUP_CODE")?,
+        cred_url: None,          // 预置后页面上不再让操作者输
+        insecure_tls: false,     // 自签入口的首次注册才打开（P1 换 ca_file）
+    });
+```
+
+`POST /__init` 一次做完：常数时间校验 setup code → `GET <cred>/enroll/<券>/bundle` →
+本机生成密钥与 CSR → `POST <cred>/enroll/<券>/certificate` → 校验 SAN 与密钥配对 →
+原子落盘。**任何一步失败都不落材料**（不给自己造一个“半初始化”的现场）。
+
+P0 **不热加载**：写完材料后提示重启，由宿主重新起 mTLS 监听。
+
 ## 示例：一个真的能跑的服务
 
 不在本仓 —— 它作为一个**独立 crate** 放着，依赖走 crates.io 上已发布的 `wist-cred-peer`，
