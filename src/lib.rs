@@ -6,6 +6,7 @@
 //! |---|---|
 //! | 握手期双向认证（客户端证书由 CA-I 签） | [`serve`] + `wist-pki` |
 //! | 接收 `register` / `revoke`（授权数据） | [`Peer::router`] |
+//! | **登录**：把一条访问令牌换成身份 + 角色 | [`login_router`] / [`Peer::login`] |
 //! | 自己的状态（摘要表、裁剪策略、有效期） | [`Peer`] + `wist-auth::credential` |
 //!
 //! ## 两种接法
@@ -47,12 +48,14 @@ mod api;
 mod config;
 mod error;
 mod init;
+mod login;
 mod peer;
 mod serve;
 
 pub use config::{Config, IdentityFiles, InitConfig};
 pub use error::{Error, Result};
 pub use init::{InitState, router as init_router, state as init_state};
+pub use login::{Login, LoginError, router as login_router};
 pub use peer::Peer;
 pub use serve::{TlsFiles, serve, serve_router, serve_when_ready};
 

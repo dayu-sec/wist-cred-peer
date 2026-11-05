@@ -25,6 +25,8 @@ wist-auth = { version = "0.3", features = ["credential", "signing"] }
 # 握手期的双向认证与「这张客户端证书是谁」。
 wist-pki = "0.1.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+# 登录端点要把“谁被拒了、为什么”说清楚（库里用 log，宿主决定落到哪）。
+log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 计算对端（入口）证书指纹：初始化页要把“我连到的到底是谁”摆给操作者核对。
